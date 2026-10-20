@@ -1,13 +1,44 @@
-# 3. FX CLI en Debian PRoot y proveedor OpenAI-compatible
+# 3. FX CLI en Debian PRoot: por qué y cómo
 
-## 1. Separación de responsabilidades
+## Por qué FX se ejecuta en Debian y no directamente en Termux
 
-- **Termux nativo:** servidor llama.cpp, OpenCL y GPU Qualcomm.
-- **Debian PRoot:** FX CLI y, en el futuro, scripts de extracción y análisis de documentos.
+Esta separación **no es una preferencia arbitraria**. Resuelve una incompatibilidad real de formato y entorno de ejecución.
 
-En el dispositivo validado, el servidor de Termux fue accesible desde Debian PRoot usando `127.0.0.1:8080`.
+**Termux no es una distribución GNU/Linux convencional:** sus programas nativos se compilan para Android, usan la biblioteca C de Android (**Bionic**) y el cargador dinámico de Android. En cambio, los ejecutables Linux distribuidos para sistemas GNU/Linux suelen estar compilados para **glibc** y esperan el cargador y las rutas de un sistema Linux convencional. Compartir arquitectura **aarch64/ARM64 no garantiza compatibilidad binaria**.
 
-Instalar y acceder a Debian con `proot-distro` según la documentación de Termux (si aún no está instalado):
+En el dispositivo de referencia, al intentar iniciar el ejecutable Linux de **FX CLI** directamente desde Termux nativo, el resultado fue:
+
+```text
+unexpected e_type: 2
+```
+
+Esto es un **síntoma de incompatibilidad al cargar el ejecutable**, no un problema con Qwen, el endpoint HTTP o la GPU. No debe interpretarse como una limitación universal de FX: podría existir en el futuro una compilación FX específica para Android/Termux, pero **la distribución que probamos no funcionó directamente allí**.
+
+**Debian mediante `proot-distro` proporciona un espacio de usuario GNU/Linux**, con sus bibliotecas, rutas y cargador compatibles con los ejecutables Linux correspondientes. PRoot permite utilizarlo **sin root de Android**. No es una máquina virtual ni convierte el kernel de Android en Linux de escritorio: crea un entorno de usuario emulado/interceptado sobre el mismo kernel. Por ello, un binario concreto puede tener limitaciones adicionales, pero **FX CLI v0.0.14 sí arrancó y funcionó dentro de Debian PRoot en este dispositivo**.
+
+### Por qué llama.cpp con GPU permanece fuera de Debian
+
+El servidor necesita llegar a las **bibliotecas OpenCL propietarias del firmware Qualcomm** y utilizar el backend Android nativo compilado en Termux. Esa ruta fue comprobada con `clinfo`, `--list-devices` y `offloaded 37/37 layers to GPU`.
+
+Ejecutar el servidor dentro de Debian PRoot complicaría el acceso a esas bibliotecas y podría mezclar ABI/glibc con bibliotecas Android/Bionic. **No afirmamos que sea imposible habilitar GPU dentro de PRoot**; simplemente **no lo necesitamos y no fue el camino validado**. El diseño probado deja cada programa en su entorno compatible:
+
+```text
+Android (mismo dispositivo y kernel)
+├── Termux nativo (binarios Android / Bionic)
+│   ├── Qualcomm OpenCL → Adreno 830
+│   └── llama-server: http://127.0.0.1:8080/v1
+└── Termux → Debian PRoot (espacio de usuario GNU/Linux)
+    └── FX CLI (binario Linux)
+        └── peticiones HTTP → 127.0.0.1:8080/v1
+```
+
+**FX no necesita acceso directo a OpenCL.** Solo necesita comunicarse por HTTP con la API compatible con OpenAI que expone llama-server. Como ambos procesos residen en el mismo teléfono y comparten la red del sistema, se conectan por **localhost**, sin un servicio en la nube ni exposición del endpoint a internet.
+
+Esta es la **razón técnica fundamental de la arquitectura híbrida**.
+
+## 1. Preparar Debian
+
+En **Termux nativo**, si aún no se dispone de Debian:
 
 ```bash
 pkg install -y proot-distro
@@ -15,13 +46,13 @@ proot-distro install debian
 proot-distro login debian
 ```
 
-**FX CLI debe estar instalado en Debian antes de este capítulo.** Se verificó FX v0.0.14 en `/root`. No incluimos aquí una instalación de FX no contrastada con una distribución/release concreta. Conservar la instalación existente.
+Para sesiones posteriores bastará con `proot-distro login debian`.
 
-## 2. Configuración conocida que funcionó
+**FX CLI debe estar instalado dentro de Debian.** Se comprobó la ejecución de **FX v0.0.14** en `/root`. La obtención e instalación desde cero del binario FX no está documentada todavía porque no se validó su método de distribución en esta instalación; no usar un comando de descarga inventado.
 
-Archivo dentro de Debian: `/root/.fx/settings.json`.
+## 2. Configurar el proveedor local de FX
 
-La configuración de referencia incluye el proveedor Codex como alternativa y el proveedor local como activo. **No sobrescribir otros proveedores o secretos existentes:** incorporar el bloque `local` y ajustar `models.local`, `provider`.
+Archivo **dentro de Debian**: `/root/.fx/settings.json`. Ejemplo operativo usado en la instalación de referencia:
 
 ```json
 {
@@ -53,9 +84,13 @@ La configuración de referencia incluye el proveedor Codex como alternativa y el
 }
 ```
 
-La clave `codex` representa una alternativa del dispositivo de referencia; no es necesaria para ejecutar el proveedor local. `auth.type=none` es apropiado solo porque la API está limitada a localhost.
+La clave `codex` es una opción alternativa que existía en esa configuración, **no un requisito**. Si FX ya tiene proveedores, claves u otros ajustes, no sobrescribirlos con este ejemplo: integrar solamente el proveedor `local` y establecer `provider: local`.
 
-Si ya existe `settings.json`, actualizar **únicamente** el contexto conservando el resto:
+Se utiliza `auth.type=none` porque `llama-server` escucha únicamente en `127.0.0.1`; no exponer el endpoint públicamente sin autenticación y controles de acceso.
+
+### Ajustar el contexto sin sustituir la configuración
+
+Si existe `settings.json`, desde Debian:
 
 ```bash
 python3 - <<'PY'
@@ -68,33 +103,35 @@ p.write_text(json.dumps(data, indent=2) + "\n")
 PY
 ```
 
-## 3. Importancia de los 16 384 tokens
+## 3. Por qué el contexto debe ser de 16 384 tokens
 
-FX incluye instrucciones del agente y esquemas de herramientas. Incluso para el mensaje **`hola`**, el servidor recibió un prompt de **7305 tokens**. Con los **8192 tokens** que se habían configurado inicialmente, FX respondió `ContextCapacityExceeded` antes de enviar la solicitud HTTP. Al establecer **16 384 tokens tanto en llama-server como en FX**, una nueva sesión de FX recibió respuesta correctamente.
+FX es un agente y prepara instrucciones, descripciones de herramientas y esquemas JSON incluso para mensajes breves. En la sesión de referencia, la petición de FX con el texto `hola` incluyó **7305 tokens de entrada**.
 
-**Los valores de contexto deben coincidir** entre `--ctx-size` y `model_metadata.context_window`. Aumentarlos consume memoria y no corrige por sí solo un posible error de gramática o de esquemas de herramientas.
+Con el contexto inicialmente configurado de `8192` tokens, FX devolvía `ContextCapacityExceeded` **antes de enviar la petición HTTP**. Al ampliar **ambos lados** a 16 384 — servidor con `--ctx-size 16384` y FX con `model_metadata.context_window: 16384` — una nueva sesión de FX pudo conversar con Qwen.
 
-## 4. Abrir FX
+**Importante:** el contexto es un límite de tokens, **no es la cantidad de memoria GPU**. Al aumentarlo crece la memoria necesaria para la caché KV. Esto no garantiza compatibilidad con esquemas de herramientas complejos.
 
-Mientras el servidor Termux permanece activo, entrar en Debian en otra sesión:
+## 4. Arrancar FX y comprobar la conexión
+
+Mantener `llama-server` funcionando en otra sesión de Termux, luego:
 
 ```bash
 proot-distro login debian
 fx
 ```
 
-Probar `hola` en una sesión nueva. La prueba verificada respondió en español y mostró `7k/16k` en la barra de estado. El servidor registró `task.n_tokens = 7305`, unos 50.7 s de duración total para aquella petición.
+Enviar `hola`. En la prueba verificada, FX respondió en español, mostró `7k/16k` y el servidor registró una petición real de 7305 tokens. El tiempo total observado fue ~50.7 segundos en esa ejecución concreta, no un rendimiento garantizado.
 
-## 5. Tool calling: validación pendiente
+## 5. Herramientas de FX: pendiente de validar
 
-El GGUF incorpora chat template con `tools` y el endpoint indica capacidades de tool calling, pero esto **no demuestra** que FX pueda ejecutar su herramienta de shell ni manejar todos sus esquemas.
+Que FX pueda conversar con Qwen **no significa** que pueda invocar sus herramientas de shell y archivos. La plantilla del modelo declara soporte de `tools`, pero la ejecución completa aún no está comprobada.
 
-Una prueba pendiente y de bajo riesgo es solicitar en FX:
+Prueba funcional sugerida (pendiente):
 
 ```text
-Ejecuta pwd usando tu herramienta de terminal y muestra el resultado.
+Ejecuta el comando pwd usando tu herramienta de terminal y muestra únicamente el resultado.
 ```
 
-Hay que observar una **invocación real** y su retorno; no basta con que el modelo escriba una ruta inventada. Los esquemas grandes pueden ocasionar errores de generación de gramática (GBNF) en ciertas versiones de llama.cpp. Si ocurre, consultar el diagnóstico y tratar la compatibilidad de herramientas como asunto separado del GPU.
+Validar en la interfaz de FX una llamada real a la herramienta y su resultado. **Una ruta escrita directamente por el modelo no es prueba de ejecución.**
 
-**No ejecutar herramientas destructivas ni procesar documentos financieros reales** hasta completar esta validación.
+Las versiones de llama.cpp pueden presentar dificultades al generar gramáticas GBNF para esquemas JSON grandes. Si se reproduce un error así, tratar la compatibilidad de herramientas como un problema separado del hardware y del tamaño del contexto. No probar acciones destructivas ni datos financieros reales hasta validar las herramientas.
