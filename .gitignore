@@ -1,0 +1,16 @@
+# Modelos y datos privados
+*.gguf
+*.safetensors
+*.bin
+*.pdf
+*.csv
+*.sqlite
+*.db
+.env
+.env.*
+settings.json
+adreno-opencl/
+build/
+build-*/
+__pycache__/
+*.log
